@@ -36,7 +36,16 @@ use crate::backend;
 use crate::constants;
 
 cfg_if! {
-    if #[cfg(curve25519_dalek_backend = "fiat")] {
+    if #[cfg(curve25519_dalek_backend = "pvm")] {
+        /// A `FieldElement` represents an element of the field
+        /// \\( \mathbb Z / (2\^{255} - 19)\\).
+        ///
+        /// The `FieldElement` type is an alias for one of the platform-specific
+        /// implementations.
+        ///
+        /// Using the PolkaVM (PVM) 256-bit wide-arithmetic instructions.
+        pub(crate) type FieldElement = backend::serial::pvm64::field::FieldElement4x64;
+    } else if #[cfg(curve25519_dalek_backend = "fiat")] {
         /// A `FieldElement` represents an element of the field
         /// \\( \mathbb Z / (2\^{255} - 19)\\).
         ///

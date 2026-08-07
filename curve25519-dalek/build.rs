@@ -50,6 +50,16 @@ fn main() {
         println!("cargo:rustc-cfg=allow_unused_unsafe");
     }
 
+    // Declare the custom cfgs used for backend selection so that builds with
+    // `-D warnings` stay clean on toolchains that check cfg names/values.
+    // (`cargo:rustc-check-cfg` is supported since Rust 1.80.)
+    if rustc_version.major > 1 || (rustc_version.major == 1 && rustc_version.minor >= 80) {
+        println!(
+            "cargo:rustc-check-cfg=cfg(curve25519_dalek_backend, values(\"fiat\", \"serial\", \"simd\", \"pvm\"))"
+        );
+        println!("cargo:rustc-check-cfg=cfg(pvm_redc)");
+    }
+
     // Backend overrides / defaults
     let curve25519_dalek_backend =
         match std::env::var("CARGO_CFG_CURVE25519_DALEK_BACKEND").as_deref() {
@@ -64,8 +74,22 @@ fn main() {
                     false => panic!("Could not override curve25519_dalek_backend to simd"),
                 }
             }
+            Ok("pvm") => {
+                // The pvm backend uses 64-bit limbs, so it requires
+                // curve25519_dalek_bits = 64.
+                match curve25519_dalek_bits {
+                    DalekBits::Dalek64 => "pvm",
+                    // If override is not possible this must result to compile error
+                    DalekBits::Dalek32 => panic!(
+                        "Could not override curve25519_dalek_backend to pvm: \
+                         it requires curve25519_dalek_bits=64"
+                    ),
+                }
+            }
+            // Unknown explicit overrides are an error
+            Ok(other) => panic!("Unknown curve25519_dalek_backend override: {other}"),
             // default between serial / simd (if potentially capable)
-            _ => match is_capable_simd(&target_arch, curve25519_dalek_bits) {
+            Err(_) => match is_capable_simd(&target_arch, curve25519_dalek_bits) {
                 true => "simd",
                 false => "serial",
             },

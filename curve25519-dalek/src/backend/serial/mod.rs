@@ -21,7 +21,12 @@
 use cfg_if::cfg_if;
 
 cfg_if! {
-    if #[cfg(curve25519_dalek_backend = "fiat")] {
+    if #[cfg(curve25519_dalek_backend = "pvm")] {
+
+        #[doc(hidden)]
+        pub mod pvm64;
+
+    } else if #[cfg(curve25519_dalek_backend = "fiat")] {
 
         #[cfg(curve25519_dalek_bits = "32")]
         #[doc(hidden)]
@@ -43,6 +48,19 @@ cfg_if! {
 
     }
 }
+
+// When the `pvm64` backend is not selected, its field arithmetic is still
+// compiled into 64-bit non-fiat test builds, so that it can be tested against
+// the default `u64` backend (the `scalar` and `constants` submodules stay
+// gated on the `pvm` backend cfg; see `pvm64/mod.rs`).
+#[cfg(all(
+    test,
+    curve25519_dalek_bits = "64",
+    not(curve25519_dalek_backend = "fiat"),
+    not(curve25519_dalek_backend = "pvm")
+))]
+#[doc(hidden)]
+pub mod pvm64;
 
 pub mod curve_models;
 

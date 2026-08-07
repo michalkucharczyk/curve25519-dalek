@@ -150,7 +150,13 @@ use crate::backend;
 use crate::constants;
 
 cfg_if! {
-    if #[cfg(curve25519_dalek_backend = "fiat")] {
+    if #[cfg(curve25519_dalek_backend = "pvm")] {
+        /// An `UnpackedScalar` represents an element of the field GF(l), optimized for speed.
+        ///
+        /// This is a type alias for one of the scalar types in the `backend`
+        /// module.
+        type UnpackedScalar = backend::serial::pvm64::scalar::Scalar52;
+    } else if #[cfg(curve25519_dalek_backend = "fiat")] {
         /// An `UnpackedScalar` represents an element of the field GF(l), optimized for speed.
         ///
         /// This is a type alias for one of the scalar types in the `backend`

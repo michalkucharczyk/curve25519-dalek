@@ -23,7 +23,9 @@ use crate::scalar::Scalar;
 use crate::edwards::EdwardsBasepointTable;
 
 cfg_if! {
-    if #[cfg(curve25519_dalek_backend = "fiat")] {
+    if #[cfg(curve25519_dalek_backend = "pvm")] {
+        pub use crate::backend::serial::pvm64::constants::*;
+    } else if #[cfg(curve25519_dalek_backend = "fiat")] {
         #[cfg(curve25519_dalek_bits = "32")]
         pub use crate::backend::serial::fiat_u32::constants::*;
         #[cfg(curve25519_dalek_bits = "64")]
@@ -157,7 +159,24 @@ mod test {
 
     /// Test that d = -121665/121666
     #[test]
-    #[cfg(all(curve25519_dalek_bits = "64", not(curve25519_dalek_backend = "fiat")))]
+    #[cfg(curve25519_dalek_backend = "pvm")]
+    fn test_d_vs_ratio() {
+        use crate::backend::serial::pvm64::field::FieldElement4x64;
+        let a = -&FieldElement4x64::from_limbs([121665, 0, 0, 0]);
+        let b = FieldElement4x64::from_limbs([121666, 0, 0, 0]);
+        let d = &a * &b.invert();
+        let d2 = &d + &d;
+        assert_eq!(d, constants::EDWARDS_D);
+        assert_eq!(d2, constants::EDWARDS_D2);
+    }
+
+    /// Test that d = -121665/121666
+    #[test]
+    #[cfg(all(
+        curve25519_dalek_bits = "64",
+        not(curve25519_dalek_backend = "fiat"),
+        not(curve25519_dalek_backend = "pvm")
+    ))]
     fn test_d_vs_ratio() {
         use crate::backend::serial::u64::field::FieldElement51;
         let a = -&FieldElement51([121665, 0, 0, 0, 0]);
