@@ -493,6 +493,77 @@ impl<'a, 'b> Sub<&'b AffineNielsPoint> for &'a EdwardsPoint {
     }
 }
 
+// In-place variants of the four additions above for the PVM backend. On the
+// PVM target, `t = &e + &niels` moves the 128-byte `CompletedPoint` result
+// through a stack temporary (rustc materializes a temporary because `t` is
+// borrowed in the right-hand side, and LLVM does not elide the copy across
+// the call); writing the output coordinates in place avoids the `memcpy`.
+// Semantically identical to the operator impls above.
+#[cfg(curve25519_dalek_backend = "pvm")]
+impl CompletedPoint {
+    /// `*self = a + b`, in place.
+    pub fn set_add(&mut self, a: &EdwardsPoint, b: &ProjectiveNielsPoint) {
+        let Y_plus_X = &a.Y + &a.X;
+        let Y_minus_X = &a.Y - &a.X;
+        let PP = &Y_plus_X * &b.Y_plus_X;
+        let MM = &Y_minus_X * &b.Y_minus_X;
+        let TT2d = &a.T * &b.T2d;
+        let ZZ = &a.Z * &b.Z;
+        let ZZ2 = &ZZ + &ZZ;
+
+        self.X = &PP - &MM;
+        self.Y = &PP + &MM;
+        self.Z = &ZZ2 + &TT2d;
+        self.T = &ZZ2 - &TT2d;
+    }
+
+    /// `*self = a - b`, in place.
+    pub fn set_sub(&mut self, a: &EdwardsPoint, b: &ProjectiveNielsPoint) {
+        let Y_plus_X = &a.Y + &a.X;
+        let Y_minus_X = &a.Y - &a.X;
+        let PM = &Y_plus_X * &b.Y_minus_X;
+        let MP = &Y_minus_X * &b.Y_plus_X;
+        let TT2d = &a.T * &b.T2d;
+        let ZZ = &a.Z * &b.Z;
+        let ZZ2 = &ZZ + &ZZ;
+
+        self.X = &PM - &MP;
+        self.Y = &PM + &MP;
+        self.Z = &ZZ2 - &TT2d;
+        self.T = &ZZ2 + &TT2d;
+    }
+
+    /// `*self = a + b`, in place.
+    pub fn set_add_affine(&mut self, a: &EdwardsPoint, b: &AffineNielsPoint) {
+        let Y_plus_X = &a.Y + &a.X;
+        let Y_minus_X = &a.Y - &a.X;
+        let PP = &Y_plus_X * &b.y_plus_x;
+        let MM = &Y_minus_X * &b.y_minus_x;
+        let Txy2d = &a.T * &b.xy2d;
+        let Z2 = &a.Z + &a.Z;
+
+        self.X = &PP - &MM;
+        self.Y = &PP + &MM;
+        self.Z = &Z2 + &Txy2d;
+        self.T = &Z2 - &Txy2d;
+    }
+
+    /// `*self = a - b`, in place.
+    pub fn set_sub_affine(&mut self, a: &EdwardsPoint, b: &AffineNielsPoint) {
+        let Y_plus_X = &a.Y + &a.X;
+        let Y_minus_X = &a.Y - &a.X;
+        let PM = &Y_plus_X * &b.y_minus_x;
+        let MP = &Y_minus_X * &b.y_plus_x;
+        let Txy2d = &a.T * &b.xy2d;
+        let Z2 = &a.Z + &a.Z;
+
+        self.X = &PM - &MP;
+        self.Y = &PM + &MP;
+        self.Z = &Z2 - &Txy2d;
+        self.T = &Z2 + &Txy2d;
+    }
+}
+
 // ------------------------------------------------------------------------
 // Negation
 // ------------------------------------------------------------------------

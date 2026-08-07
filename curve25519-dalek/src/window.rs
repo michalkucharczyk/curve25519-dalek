@@ -184,11 +184,28 @@ pub(crate) struct NafLookupTable5<T>(pub(crate) [T; 8]);
 
 impl<T: Copy> NafLookupTable5<T> {
     /// Given public, odd \\( x \\) with \\( 0 < x < 2^4 \\), return \\(xA\\).
+    // The pvm backend uses `select_ref` instead; without `alloc` this can
+    // then be entirely unused.
+    #[cfg_attr(curve25519_dalek_backend = "pvm", allow(dead_code))]
     pub fn select(&self, x: usize) -> T {
         debug_assert_eq!(x & 1, 1);
         debug_assert!(x < 16);
 
         self.0[x / 2]
+    }
+}
+
+#[cfg(curve25519_dalek_backend = "pvm")]
+impl<T> NafLookupTable5<T> {
+    /// As [`Self::select`], but returning the entry by reference. This is a
+    /// variable-time lookup either way; returning a reference avoids copying
+    /// the (large) point struct, which is disproportionately expensive on
+    /// the PVM target.
+    pub fn select_ref(&self, x: usize) -> &T {
+        debug_assert_eq!(x & 1, 1);
+        debug_assert!(x < 16);
+
+        &self.0[x / 2]
     }
 }
 
@@ -198,12 +215,34 @@ impl<T: Debug> Debug for NafLookupTable5<T> {
     }
 }
 
+#[cfg(not(curve25519_dalek_backend = "pvm"))]
 impl<'a> From<&'a EdwardsPoint> for NafLookupTable5<ProjectiveNielsPoint> {
     fn from(A: &'a EdwardsPoint) -> Self {
         let mut Ai = [A.as_projective_niels(); 8];
         let A2 = A.double();
         for i in 0..7 {
             Ai[i + 1] = (&A2 + &Ai[i]).as_extended().as_projective_niels();
+        }
+        // Now Ai = [A, 3A, 5A, 7A, 9A, 11A, 13A, 15A]
+        NafLookupTable5(Ai)
+    }
+}
+
+// As the generic impl above, but with the new table entry's fields written
+// in place: `Ai[i + 1] = <chain>` moves the 128-byte `ProjectiveNielsPoint`
+// through a stack temporary (a `memcpy` call on the PVM target).
+#[cfg(curve25519_dalek_backend = "pvm")]
+impl<'a> From<&'a EdwardsPoint> for NafLookupTable5<ProjectiveNielsPoint> {
+    fn from(A: &'a EdwardsPoint) -> Self {
+        let mut Ai = [A.as_projective_niels(); 8];
+        let A2 = A.double();
+        for i in 0..7 {
+            // Inlined `.as_projective_niels()` of `(&A2 + &Ai[i]).as_extended()`.
+            let e = (&A2 + &Ai[i]).as_extended();
+            Ai[i + 1].Y_plus_X = &e.Y + &e.X;
+            Ai[i + 1].Y_minus_X = &e.Y - &e.X;
+            Ai[i + 1].Z = e.Z;
+            Ai[i + 1].T2d = &e.T * &crate::constants::EDWARDS_D2;
         }
         // Now Ai = [A, 3A, 5A, 7A, 9A, 11A, 13A, 15A]
         NafLookupTable5(Ai)
@@ -230,11 +269,31 @@ pub(crate) struct NafLookupTable8<T>(pub(crate) [T; 64]);
 
 #[cfg(any(feature = "precomputed-tables", feature = "alloc"))]
 impl<T: Copy> NafLookupTable8<T> {
+    // The pvm backend uses `select_ref` instead; without `alloc` this can
+    // then be entirely unused.
+    #[cfg_attr(curve25519_dalek_backend = "pvm", allow(dead_code))]
     pub fn select(&self, x: usize) -> T {
         debug_assert_eq!(x & 1, 1);
         debug_assert!(x < 128);
 
         self.0[x / 2]
+    }
+}
+
+#[cfg(all(
+    curve25519_dalek_backend = "pvm",
+    any(feature = "precomputed-tables", feature = "alloc")
+))]
+impl<T> NafLookupTable8<T> {
+    /// As [`Self::select`], but returning the entry by reference. This is a
+    /// variable-time lookup either way; returning a reference avoids copying
+    /// the (large) point struct, which is disproportionately expensive on
+    /// the PVM target.
+    pub fn select_ref(&self, x: usize) -> &T {
+        debug_assert_eq!(x & 1, 1);
+        debug_assert!(x < 128);
+
+        &self.0[x / 2]
     }
 }
 
