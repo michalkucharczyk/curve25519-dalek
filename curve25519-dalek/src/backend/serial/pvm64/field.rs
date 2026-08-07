@@ -13,8 +13,15 @@
 //! in [`FieldElement4x64::as_bytes`]. Reductions after multiplication fold
 //! the value modulo \\(2\^{256} - 38 = 2p\\), which preserves congruence
 //! modulo \\(p\\).
+//!
+//! Since the wide-arithmetic instructions operate on limb buffers in memory
+//! and are specified read-all-then-write (the destination may fully or
+//! partially alias the sources), all field operations work directly in the
+//! `FieldElement` limb buffers, with a single stack-allocated 512-bit
+//! scratch buffer for products; there are no intermediate copies.
 
 use core::fmt::Debug;
+use core::mem::MaybeUninit;
 use core::ops::Neg;
 use core::ops::{Add, AddAssign};
 use core::ops::{Mul, MulAssign};
@@ -29,123 +36,117 @@ use zeroize::Zeroize;
 /// Wrappers around the five PVM 256-bit wide-arithmetic instructions.
 ///
 /// All operands are little-endian 4×u64 (or 8×u64 for 512-bit values) limb
-/// buffers in memory. On the PVM guest target (`riscv64` with the `e` target
-/// feature, as targeted by `polkavm-derive`) the operations are emitted as
-/// `.insn`-encoded instructions in the custom-0 (`0xb`) opcode space; the
-/// destination buffer may alias the sources (read-all-then-write semantics),
-/// although these safe wrappers always use a fresh destination.
+/// buffers in memory, passed as raw pointers. The instructions are specified
+/// read-all-then-write: `dst` may fully or partially alias any source
+/// operand.
+///
+/// On the PVM guest target (`riscv64` with the `e` target feature, as
+/// targeted by `polkavm-derive`) the operations are emitted as
+/// `.insn`-encoded instructions in the custom-0 (`0xb`) opcode space.
 ///
 /// On every other target, pure-Rust `u128`-based fallbacks are used instead.
-/// The fallbacks are copied from `polkavm-common`'s `operation.rs`
-/// (`wide_mul256`, `wide_add256`, `wide_sub256`, `wide_mul256_by_u64`,
-/// `wide_redc256`), which are the normative reference semantics for these
-/// instructions (the PVM interpreter runs exactly that code). They MUST be
-/// kept in sync with `polkavm-common`.
+/// The fallbacks' arithmetic is copied from `polkavm-common`'s
+/// `operation.rs` (`wide_mul256`, `wide_add256`, `wide_sub256`,
+/// `wide_mul256_by_u64`, `wide_redc256`), which are the normative reference
+/// semantics for these instructions (the PVM interpreter runs exactly that
+/// code). They MUST be kept in sync with `polkavm-common`.
+///
+/// # Safety
+///
+/// All functions require `dst`, `lhs`, `rhs` and `src` to be valid,
+/// 8-byte-aligned pointers to 4 u64 limbs (8 limbs for the 512-bit
+/// `mul256` destination and `redc256` source). Any aliasing between the
+/// operands is allowed.
 #[allow(dead_code)] // Which of `redc256`/`mul256_by_u64` is used depends on cfg(pvm_redc).
 mod intrinsics {
     #[cfg(all(target_arch = "riscv64", target_feature = "e"))]
     mod imp {
         use core::arch::asm;
-        use core::mem::MaybeUninit;
 
-        /// Full 512-bit product: returns `lhs * rhs`.
+        /// Full 512-bit product: `dst[0..8] = lhs[0..4] * rhs[0..4]`.
         #[inline(always)]
-        pub fn mul256(lhs: &[u64; 4], rhs: &[u64; 4]) -> [u64; 8] {
-            let mut dst = MaybeUninit::<[u64; 8]>::uninit();
-            unsafe {
-                asm!(
-                    ".insn r 0xb, 4, 0, {d}, {a}, {b}",
-                    d = in(reg) dst.as_mut_ptr(),
-                    a = in(reg) lhs.as_ptr(),
-                    b = in(reg) rhs.as_ptr(),
-                    options(nostack),
-                );
-                dst.assume_init()
-            }
+        pub unsafe fn mul256(dst: *mut u64, lhs: *const u64, rhs: *const u64) {
+            asm!(
+                ".insn r 0xb, 4, 0, {d}, {a}, {b}",
+                d = in(reg) dst,
+                a = in(reg) lhs,
+                b = in(reg) rhs,
+                options(nostack),
+            );
         }
 
-        /// Folds a 512-bit value modulo `2^256 - k`; the result is congruent
-        /// to `src` and always below `2^256`, but not fully canonicalized.
+        /// Folds the 512-bit `src[0..8]` modulo `2^256 - k` into `dst[0..4]`;
+        /// the result is congruent to `src` and always below `2^256`, but not
+        /// fully canonicalized.
         #[inline(always)]
-        pub fn redc256(src: &[u64; 8], k: u64) -> [u64; 4] {
-            let mut dst = MaybeUninit::<[u64; 4]>::uninit();
-            unsafe {
-                asm!(
-                    ".insn r 0xb, 4, 1, {d}, {s}, {k}",
-                    d = in(reg) dst.as_mut_ptr(),
-                    s = in(reg) src.as_ptr(),
-                    k = in(reg) k,
-                    options(nostack),
-                );
-                dst.assume_init()
-            }
+        pub unsafe fn redc256(dst: *mut u64, src: *const u64, k: u64) {
+            asm!(
+                ".insn r 0xb, 4, 1, {d}, {s}, {k}",
+                d = in(reg) dst,
+                s = in(reg) src,
+                k = in(reg) k,
+                options(nostack),
+            );
         }
 
-        /// Returns `(lhs + rhs) mod 2^256` and the carry-out (0 or 1).
+        /// `dst[0..4] = (lhs + rhs) mod 2^256`; returns the carry-out (0 or 1).
         #[inline(always)]
-        pub fn add256(lhs: &[u64; 4], rhs: &[u64; 4]) -> ([u64; 4], u64) {
-            let mut dst = MaybeUninit::<[u64; 4]>::uninit();
+        pub unsafe fn add256(dst: *mut u64, lhs: *const u64, rhs: *const u64) -> u64 {
             let carry: u64;
-            unsafe {
-                asm!(
-                    ".insn r4 0xb, 5, 0, {c}, {a}, {b}, {d}",
-                    c = out(reg) carry,
-                    a = in(reg) lhs.as_ptr(),
-                    b = in(reg) rhs.as_ptr(),
-                    d = in(reg) dst.as_mut_ptr(),
-                    options(nostack),
-                );
-                (dst.assume_init(), carry)
-            }
+            asm!(
+                ".insn r4 0xb, 5, 0, {c}, {a}, {b}, {d}",
+                c = out(reg) carry,
+                a = in(reg) lhs,
+                b = in(reg) rhs,
+                d = in(reg) dst,
+                options(nostack),
+            );
+            carry
         }
 
-        /// Returns `(lhs - rhs) mod 2^256` and the borrow-out (0 or 1).
+        /// `dst[0..4] = (lhs - rhs) mod 2^256`; returns the borrow-out (0 or 1).
         #[inline(always)]
-        pub fn sub256(lhs: &[u64; 4], rhs: &[u64; 4]) -> ([u64; 4], u64) {
-            let mut dst = MaybeUninit::<[u64; 4]>::uninit();
+        pub unsafe fn sub256(dst: *mut u64, lhs: *const u64, rhs: *const u64) -> u64 {
             let borrow: u64;
-            unsafe {
-                asm!(
-                    ".insn r4 0xb, 5, 1, {c}, {a}, {b}, {d}",
-                    c = out(reg) borrow,
-                    a = in(reg) lhs.as_ptr(),
-                    b = in(reg) rhs.as_ptr(),
-                    d = in(reg) dst.as_mut_ptr(),
-                    options(nostack),
-                );
-                (dst.assume_init(), borrow)
-            }
+            asm!(
+                ".insn r4 0xb, 5, 1, {c}, {a}, {b}, {d}",
+                c = out(reg) borrow,
+                a = in(reg) lhs,
+                b = in(reg) rhs,
+                d = in(reg) dst,
+                options(nostack),
+            );
+            borrow
         }
 
-        /// Returns `low256(lhs * rhs)` and bits 256..319 of the full product.
+        /// `dst[0..4] = low256(lhs * rhs)`; returns bits 256..319 of the full
+        /// product.
         #[inline(always)]
-        pub fn mul256_by_u64(lhs: &[u64; 4], rhs: u64) -> ([u64; 4], u64) {
-            let mut dst = MaybeUninit::<[u64; 4]>::uninit();
+        pub unsafe fn mul256_by_u64(dst: *mut u64, lhs: *const u64, rhs: u64) -> u64 {
             let hi: u64;
-            unsafe {
-                asm!(
-                    ".insn r4 0xb, 5, 2, {hi}, {a}, {m}, {d}",
-                    hi = out(reg) hi,
-                    a = in(reg) lhs.as_ptr(),
-                    m = in(reg) rhs,
-                    d = in(reg) dst.as_mut_ptr(),
-                    options(nostack),
-                );
-                (dst.assume_init(), hi)
-            }
+            asm!(
+                ".insn r4 0xb, 5, 2, {hi}, {a}, {m}, {d}",
+                hi = out(reg) hi,
+                a = in(reg) lhs,
+                m = in(reg) rhs,
+                d = in(reg) dst,
+                options(nostack),
+            );
+            hi
         }
     }
 
-    // Pure-Rust fallbacks, copied verbatim (modulo names) from
-    // `polkavm-common/src/operation.rs`. These are the normative semantics of
-    // the PVM instructions and MUST be kept in sync with that file.
+    // Pure-Rust fallbacks. The `wide_*` reference functions are copied
+    // verbatim from `polkavm-common/src/operation.rs`; the pointer-style
+    // wrappers read all inputs before writing the destination, matching the
+    // instructions' read-all-then-write aliasing semantics.
     #[cfg(not(all(target_arch = "riscv64", target_feature = "e")))]
     mod imp {
-        /// Full 512-bit product: returns `lhs * rhs`.
-        ///
+        use core::ptr;
+
         /// Sync with `wide_mul256` in `polkavm-common/src/operation.rs`.
         #[inline]
-        pub fn mul256(lhs: &[u64; 4], rhs: &[u64; 4]) -> [u64; 8] {
+        fn wide_mul256(lhs: &[u64; 4], rhs: &[u64; 4]) -> [u64; 8] {
             let mut result = [0u64; 8];
             for i in 0..4 {
                 let mut carry: u128 = 0;
@@ -160,11 +161,9 @@ mod intrinsics {
             result
         }
 
-        /// Returns `(lhs + rhs) mod 2^256` and the carry-out (0 or 1).
-        ///
         /// Sync with `wide_add256` in `polkavm-common/src/operation.rs`.
         #[inline]
-        pub fn add256(lhs: &[u64; 4], rhs: &[u64; 4]) -> ([u64; 4], u64) {
+        fn wide_add256(lhs: &[u64; 4], rhs: &[u64; 4]) -> ([u64; 4], u64) {
             let mut result = [0u64; 4];
             let mut carry: u128 = 0;
             for i in 0..4 {
@@ -175,11 +174,9 @@ mod intrinsics {
             (result, carry as u64)
         }
 
-        /// Returns `(lhs - rhs) mod 2^256` and the borrow-out (0 or 1).
-        ///
         /// Sync with `wide_sub256` in `polkavm-common/src/operation.rs`.
         #[inline]
-        pub fn sub256(lhs: &[u64; 4], rhs: &[u64; 4]) -> ([u64; 4], u64) {
+        fn wide_sub256(lhs: &[u64; 4], rhs: &[u64; 4]) -> ([u64; 4], u64) {
             let mut result = [0u64; 4];
             let mut borrow: u64 = 0;
             for i in 0..4 {
@@ -191,11 +188,9 @@ mod intrinsics {
             (result, borrow)
         }
 
-        /// Returns `low256(lhs * rhs)` and bits 256..319 of the full product.
-        ///
         /// Sync with `wide_mul256_by_u64` in `polkavm-common/src/operation.rs`.
         #[inline]
-        pub fn mul256_by_u64(lhs: &[u64; 4], rhs: u64) -> ([u64; 4], u64) {
+        fn wide_mul256_by_u64(lhs: &[u64; 4], rhs: u64) -> ([u64; 4], u64) {
             let mut result = [0u64; 4];
             let mut carry: u128 = 0;
             for i in 0..4 {
@@ -213,7 +208,7 @@ mod intrinsics {
         ///
         /// Sync with `wide_redc256` in `polkavm-common/src/operation.rs`.
         #[inline]
-        pub fn redc256(src: &[u64; 8], k: u64) -> [u64; 4] {
+        fn wide_redc256(src: &[u64; 8], k: u64) -> [u64; 4] {
             // t = t_lo + k·t_hi (5 limbs; ≤ 2^320 + 2^256)
             let mut t = [0u64; 5];
             let mut carry: u128 = 0;
@@ -226,15 +221,60 @@ mod intrinsics {
 
             // h = t >> 256 (≤ k); u = (t mod 2^256) + k·h (≤ 2^256 - 1 + k²)
             let kh = u128::from(k) * u128::from(t[4]);
-            let (u, c) = add256(
+            let (u, c) = wide_add256(
                 &[t[0], t[1], t[2], t[3]],
                 &[kh as u64, (kh >> 64) as u64, 0, 0],
             );
 
             // dst = (u mod 2^256) + k·c; c ∈ {0, 1} and k² + k < 2^128, so this never carries.
-            let (dst, overflow) = add256(&u, &[if c != 0 { k } else { 0 }, 0, 0, 0]);
+            let (dst, overflow) = wide_add256(&u, &[if c != 0 { k } else { 0 }, 0, 0, 0]);
             debug_assert_eq!(overflow, 0);
             dst
+        }
+
+        /// Full 512-bit product: `dst[0..8] = lhs[0..4] * rhs[0..4]`.
+        #[inline(always)]
+        pub unsafe fn mul256(dst: *mut u64, lhs: *const u64, rhs: *const u64) {
+            let lhs = ptr::read(lhs as *const [u64; 4]);
+            let rhs = ptr::read(rhs as *const [u64; 4]);
+            ptr::write(dst as *mut [u64; 8], wide_mul256(&lhs, &rhs));
+        }
+
+        /// Folds the 512-bit `src[0..8]` modulo `2^256 - k` into `dst[0..4]`.
+        #[inline(always)]
+        pub unsafe fn redc256(dst: *mut u64, src: *const u64, k: u64) {
+            let src = ptr::read(src as *const [u64; 8]);
+            ptr::write(dst as *mut [u64; 4], wide_redc256(&src, k));
+        }
+
+        /// `dst[0..4] = (lhs + rhs) mod 2^256`; returns the carry-out (0 or 1).
+        #[inline(always)]
+        pub unsafe fn add256(dst: *mut u64, lhs: *const u64, rhs: *const u64) -> u64 {
+            let lhs = ptr::read(lhs as *const [u64; 4]);
+            let rhs = ptr::read(rhs as *const [u64; 4]);
+            let (result, carry) = wide_add256(&lhs, &rhs);
+            ptr::write(dst as *mut [u64; 4], result);
+            carry
+        }
+
+        /// `dst[0..4] = (lhs - rhs) mod 2^256`; returns the borrow-out (0 or 1).
+        #[inline(always)]
+        pub unsafe fn sub256(dst: *mut u64, lhs: *const u64, rhs: *const u64) -> u64 {
+            let lhs = ptr::read(lhs as *const [u64; 4]);
+            let rhs = ptr::read(rhs as *const [u64; 4]);
+            let (result, borrow) = wide_sub256(&lhs, &rhs);
+            ptr::write(dst as *mut [u64; 4], result);
+            borrow
+        }
+
+        /// `dst[0..4] = low256(lhs * rhs)`; returns bits 256..319 of the full
+        /// product.
+        #[inline(always)]
+        pub unsafe fn mul256_by_u64(dst: *mut u64, lhs: *const u64, rhs: u64) -> u64 {
+            let lhs = ptr::read(lhs as *const [u64; 4]);
+            let (result, hi) = wide_mul256_by_u64(&lhs, rhs);
+            ptr::write(dst as *mut [u64; 4], result);
+            hi
         }
     }
 
@@ -268,56 +308,109 @@ const P: [u64; 4] = [
     0x7fff_ffff_ffff_ffff,
 ];
 
-/// Fold the excess above \\(2\^{256}\\) back into the low 256 bits, using
-/// \\(2\^{256} \equiv 38 \pmod p\\). Requires `excess <= 38`.
+/// Fold operands `[38·i, 0, 0, 0]` for `i` in `0..=38`, indexed by a
+/// carry/borrow/excess value. Using a static table instead of building the
+/// operand on the stack saves four stores per fold.
 ///
-/// The first fold can itself carry (when the limbs are close to
-/// \\(2\^{256}\\)), but after such a carry the low limbs are tiny, so the
-/// second fold can never carry.
+/// The lookup address depends on the (potentially secret-derived) carry, but
+/// every PVM instruction has uniform cost, so this is not observable under
+/// the PVM execution model this backend targets.
+static FOLD: [[u64; 4]; 39] = {
+    let mut table = [[0u64; 4]; 39];
+    let mut i = 0;
+    while i < 39 {
+        table[i][0] = 38 * i as u64;
+        i += 1;
+    }
+    table
+};
+
+/// Pointer to the fold operand `[38·excess, 0, 0, 0]`. Requires
+/// `excess <= 38`.
 #[inline(always)]
-fn fold_carry(limbs: [u64; 4], excess: u64) -> [u64; 4] {
+fn fold_operand(excess: u64) -> *const u64 {
     debug_assert!(excess <= 38);
-    let (limbs, carry) = intrinsics::add256(&limbs, &[38 * excess, 0, 0, 0]);
-    let (limbs, carry) = intrinsics::add256(&limbs, &[38 * carry, 0, 0, 0]);
-    debug_assert_eq!(carry, 0);
-    limbs
+    unsafe { (FOLD.as_ptr() as *const u64).add((excess as usize) << 2) }
 }
 
-/// Fold a `sub256` borrow back into the low 256 bits, by subtracting
-/// \\(38 \cdot \mathrm{borrow}\\) (since \\(-2\^{256} \equiv -38 \pmod p\\)).
+/// `out = a + b (mod 2^256 - 38)`: a full field addition, folding the carry
+/// via \\(2\^{256} \equiv 38 \pmod p\\). The first fold can itself carry
+/// (when the limbs are close to \\(2\^{256}\\)), but after such a carry the
+/// low limbs are tiny, so the second fold can never carry.
 ///
-/// The first fold can itself borrow (when the limbs are tiny), but after such
-/// a borrow the value is close to \\(2\^{256}\\), so the second fold can
-/// never borrow.
+/// The intermediate sums accumulate in `scratch` and only the final fold
+/// writes `out`, exactly once. Keeping `out` write-once (like the `mul256`/
+/// `redc256` pair) lets LLVM merge the output slot with the caller's
+/// destination variable instead of emitting a 4-limb copy; for the in-place
+/// (`+=`) case, pass the destination itself as `scratch`.
+///
+/// # Safety
+///
+/// `out` and `scratch` must be valid pointers to 4 u64 limbs, `a` and `b`
+/// valid for reading 4 u64 limbs. Any aliasing is allowed.
 #[inline(always)]
-fn fold_borrow(limbs: [u64; 4], borrow: u64) -> [u64; 4] {
-    debug_assert!(borrow <= 1);
-    let (limbs, borrow) = intrinsics::sub256(&limbs, &[38 * borrow, 0, 0, 0]);
-    let (limbs, borrow) = intrinsics::sub256(&limbs, &[38 * borrow, 0, 0, 0]);
-    debug_assert_eq!(borrow, 0);
-    limbs
+unsafe fn add_fold(out: *mut u64, a: *const u64, b: *const u64, scratch: *mut u64) {
+    let carry = intrinsics::add256(scratch, a, b);
+    let carry = intrinsics::add256(scratch, scratch, fold_operand(carry));
+    let carry = intrinsics::add256(out, scratch, fold_operand(carry));
+    debug_assert_eq!(carry, 0);
 }
 
-/// Reduce a 512-bit product to a 256-bit residue modulo
-/// \\(2\^{256} - 38 = 2p\\).
+/// `out = a - b (mod 2^256 - 38)`: a full field subtraction, folding the
+/// borrow by subtracting \\(38 \cdot \mathrm{borrow}\\) (since
+/// \\(-2\^{256} \equiv -38 \pmod p\\)). The first fold can itself borrow
+/// (when the difference is tiny), but after such a borrow the value is close
+/// to \\(2\^{256}\\), so the second fold can never borrow.
+///
+/// See [`add_fold`] for the role of `scratch` and the write-once `out`.
+///
+/// # Safety
+///
+/// As for [`add_fold`].
+#[inline(always)]
+unsafe fn sub_fold(out: *mut u64, a: *const u64, b: *const u64, scratch: *mut u64) {
+    let borrow = intrinsics::sub256(scratch, a, b);
+    let borrow = intrinsics::sub256(scratch, scratch, fold_operand(borrow));
+    let borrow = intrinsics::sub256(out, scratch, fold_operand(borrow));
+    debug_assert_eq!(borrow, 0);
+}
+
+/// Reduce the 512-bit product at `wide` to a 256-bit residue modulo
+/// \\(2\^{256} - 38 = 2p\\), written to `dst`.
+///
+/// # Safety
+///
+/// `dst` must be valid for 4 u64 limbs and `wide` for 8; they must not
+/// overlap (`wide` is always a private stack scratch buffer here).
 #[cfg(pvm_redc)]
 #[inline(always)]
-fn reduce_wide(wide: &[u64; 8]) -> [u64; 4] {
-    intrinsics::redc256(wide, 38)
+unsafe fn reduce_wide(dst: *mut u64, wide: *mut u64) {
+    intrinsics::redc256(dst, wide, 38);
 }
 
-/// Reduce a 512-bit product to a 256-bit residue modulo
-/// \\(2\^{256} - 38 = 2p\\), without the `redc256` instruction.
+/// Reduce the 512-bit product at `wide` to a 256-bit residue modulo
+/// \\(2\^{256} - 38 = 2p\\), written to `dst`, without the `redc256`
+/// instruction. Clobbers `wide`. As in [`add_fold`], the intermediate sums
+/// accumulate in the scratch buffer and only the final fold writes `dst`,
+/// exactly once.
+///
+/// # Safety
+///
+/// `dst` must be valid for 4 u64 limbs and `wide` for 8; they must not
+/// overlap (`wide` is always a private stack scratch buffer here).
 #[cfg(not(pvm_redc))]
 #[inline(always)]
-fn reduce_wide(wide: &[u64; 8]) -> [u64; 4] {
-    let lo = [wide[0], wide[1], wide[2], wide[3]];
-    let hi = [wide[4], wide[5], wide[6], wide[7]];
-    // lo + 2^256·hi ≡ lo + 38·hi (mod 2^256 - 38)
-    let (h, h_hi) = intrinsics::mul256_by_u64(&hi, 38); // h_hi ≤ 37
-    let (t, c) = intrinsics::add256(&lo, &h);
-    // t + 2^256·(h_hi + c), with h_hi + c ≤ 38
-    fold_carry(t, h_hi + c)
+unsafe fn reduce_wide(dst: *mut u64, wide: *mut u64) {
+    let lo = wide;
+    let hi = wide.add(4);
+    // lo + 2^256·hi ≡ lo + 38·hi (mod 2^256 - 38); compute 38·hi in place
+    // over the high half of the scratch buffer.
+    let h_hi = intrinsics::mul256_by_u64(hi, hi, 38); // h_hi ≤ 37
+    let carry = intrinsics::add256(lo, lo, hi);
+    // lo + 2^256·(h_hi + carry), with h_hi + carry ≤ 38
+    let carry = intrinsics::add256(lo, lo, fold_operand(h_hi + carry));
+    let carry = intrinsics::add256(dst, lo, fold_operand(carry));
+    debug_assert_eq!(carry, 0);
 }
 
 impl Debug for FieldElement4x64 {
@@ -334,56 +427,103 @@ impl Zeroize for FieldElement4x64 {
 }
 
 impl<'b> AddAssign<&'b FieldElement4x64> for FieldElement4x64 {
+    #[inline(always)]
     fn add_assign(&mut self, rhs: &'b FieldElement4x64) {
-        let (sum, carry) = intrinsics::add256(&self.0, &rhs.0);
-        self.0 = fold_carry(sum, carry);
+        unsafe {
+            let dst = self.0.as_mut_ptr();
+            add_fold(dst, dst, rhs.0.as_ptr(), dst);
+        }
     }
 }
 
 impl<'a, 'b> Add<&'b FieldElement4x64> for &'a FieldElement4x64 {
     type Output = FieldElement4x64;
+    #[inline(always)]
     fn add(self, rhs: &'b FieldElement4x64) -> FieldElement4x64 {
-        let mut output = *self;
-        output += rhs;
-        output
+        let mut output = MaybeUninit::<FieldElement4x64>::uninit();
+        unsafe {
+            let mut scratch = MaybeUninit::<[u64; 4]>::uninit();
+            add_fold(
+                output.as_mut_ptr() as *mut u64,
+                self.0.as_ptr(),
+                rhs.0.as_ptr(),
+                scratch.as_mut_ptr() as *mut u64,
+            );
+            output.assume_init()
+        }
     }
 }
 
 impl<'b> SubAssign<&'b FieldElement4x64> for FieldElement4x64 {
+    #[inline(always)]
     fn sub_assign(&mut self, rhs: &'b FieldElement4x64) {
-        let (diff, borrow) = intrinsics::sub256(&self.0, &rhs.0);
-        self.0 = fold_borrow(diff, borrow);
+        unsafe {
+            let dst = self.0.as_mut_ptr();
+            sub_fold(dst, dst, rhs.0.as_ptr(), dst);
+        }
     }
 }
 
 impl<'a, 'b> Sub<&'b FieldElement4x64> for &'a FieldElement4x64 {
     type Output = FieldElement4x64;
+    #[inline(always)]
     fn sub(self, rhs: &'b FieldElement4x64) -> FieldElement4x64 {
-        let mut output = *self;
-        output -= rhs;
-        output
+        let mut output = MaybeUninit::<FieldElement4x64>::uninit();
+        unsafe {
+            let mut scratch = MaybeUninit::<[u64; 4]>::uninit();
+            sub_fold(
+                output.as_mut_ptr() as *mut u64,
+                self.0.as_ptr(),
+                rhs.0.as_ptr(),
+                scratch.as_mut_ptr() as *mut u64,
+            );
+            output.assume_init()
+        }
     }
 }
 
 impl<'b> MulAssign<&'b FieldElement4x64> for FieldElement4x64 {
+    #[inline(always)]
     fn mul_assign(&mut self, rhs: &'b FieldElement4x64) {
-        self.0 = reduce_wide(&intrinsics::mul256(&self.0, &rhs.0));
+        unsafe {
+            let mut wide = MaybeUninit::<[u64; 8]>::uninit();
+            let wide = wide.as_mut_ptr() as *mut u64;
+            intrinsics::mul256(wide, self.0.as_ptr(), rhs.0.as_ptr());
+            reduce_wide(self.0.as_mut_ptr(), wide);
+        }
     }
 }
 
 impl<'a, 'b> Mul<&'b FieldElement4x64> for &'a FieldElement4x64 {
     type Output = FieldElement4x64;
+    #[inline(always)]
     fn mul(self, rhs: &'b FieldElement4x64) -> FieldElement4x64 {
-        FieldElement4x64(reduce_wide(&intrinsics::mul256(&self.0, &rhs.0)))
+        let mut output = MaybeUninit::<FieldElement4x64>::uninit();
+        unsafe {
+            let mut wide = MaybeUninit::<[u64; 8]>::uninit();
+            let wide = wide.as_mut_ptr() as *mut u64;
+            intrinsics::mul256(wide, self.0.as_ptr(), rhs.0.as_ptr());
+            reduce_wide(output.as_mut_ptr() as *mut u64, wide);
+            output.assume_init()
+        }
     }
 }
 
 impl<'a> Neg for &'a FieldElement4x64 {
     type Output = FieldElement4x64;
+    #[inline(always)]
     fn neg(self) -> FieldElement4x64 {
-        let mut output = *self;
-        output.negate();
-        output
+        let mut output = MaybeUninit::<FieldElement4x64>::uninit();
+        unsafe {
+            let mut scratch = MaybeUninit::<[u64; 4]>::uninit();
+            sub_fold(
+                output.as_mut_ptr() as *mut u64,
+                FieldElement4x64::ZERO.0.as_ptr(),
+                self.0.as_ptr(),
+                scratch.as_mut_ptr() as *mut u64,
+            );
+            output.assume_init()
+        }
     }
 }
 
@@ -434,8 +574,12 @@ impl FieldElement4x64 {
     ]);
 
     /// Invert the sign of this field element.
+    #[inline(always)]
     pub fn negate(&mut self) {
-        *self = &FieldElement4x64::ZERO - self;
+        unsafe {
+            let dst = self.0.as_mut_ptr();
+            sub_fold(dst, FieldElement4x64::ZERO.0.as_ptr(), dst, dst);
+        }
     }
 
     /// Load a `FieldElement4x64` from the low 255 bits of a 256-bit input.
@@ -467,32 +611,30 @@ impl FieldElement4x64 {
         // The first application brings any v < 2^256 below 2^255 (but for
         // v ∈ [2p, 2p + 19) it yields a value in [p, p + 19), which is why a
         // single pass is not enough); the second brings any v < 2^255 below
-        // p. This is cold-path glue, so plain u128 arithmetic is used instead
-        // of the wide-arithmetic intrinsics.
-        fn reduce_once(v: [u64; 4]) -> [u64; 4] {
-            // q = (v + 19) >> 255
-            let mut t = [0u64; 4];
-            let mut carry: u128 = 19;
-            for i in 0..4 {
-                let acc = u128::from(v[i]) + carry;
-                t[i] = acc as u64;
-                carry = acc >> 64;
-            }
-            let q = ((carry as u64) << 1) | (t[3] >> 63);
-            debug_assert!(q <= 2);
+        // p.
+        static NINETEEN_Q: [[u64; 4]; 3] = [[0, 0, 0, 0], [19, 0, 0, 0], [38, 0, 0, 0]];
 
-            // r = v - q·(2^255 - 19) = (v + 19·q) - q·2^255. Since r < 2^255,
-            // the bits ≥ 255 of (v + 19·q) are exactly q; clear them.
-            let mut r = [0u64; 4];
-            let mut carry: u128 = u128::from(19 * q);
-            for i in 0..4 {
-                let acc = u128::from(v[i]) + carry;
-                r[i] = acc as u64;
-                carry = acc >> 64;
+        // As with `FOLD`, the secret-dependent table index is fine under the
+        // PVM execution model this backend targets.
+        fn reduce_once(v: [u64; 4]) -> [u64; 4] {
+            let mut r = MaybeUninit::<[u64; 4]>::uninit();
+            unsafe {
+                let r = r.as_mut_ptr() as *mut u64;
+                // q = (v + 19) >> 255; reuse r as scratch for v + 19.
+                let carry = intrinsics::add256(r, v.as_ptr(), NINETEEN_Q[1].as_ptr());
+                let q = (carry << 1) | (*r.add(3) >> 63);
+                debug_assert!(q <= 2);
+
+                // r = v - q·(2^255 - 19) = (v + 19·q) - q·2^255. Since
+                // r < 2^255, the bits ≥ 255 of (v + 19·q) — the add256
+                // carry-out and the top bit of the last limb — are exactly q;
+                // drop and clear them.
+                let nineteen_q = (NINETEEN_Q.as_ptr() as *const u64).add((q as usize) << 2);
+                let carry = intrinsics::add256(r, v.as_ptr(), nineteen_q);
+                debug_assert_eq!((carry << 1) | (*r.add(3) >> 63), q);
+                *r.add(3) &= 0x7fff_ffff_ffff_ffff;
             }
-            debug_assert_eq!(((carry as u64) << 1) | (r[3] >> 63), q);
-            r[3] &= 0x7fff_ffff_ffff_ffff;
-            r
+            unsafe { r.assume_init() }
         }
 
         let r = reduce_once(reduce_once(self.0));
@@ -511,24 +653,52 @@ impl FieldElement4x64 {
     }
 
     /// Given `k > 0`, return `self^(2^k)`.
+    #[inline(always)]
     pub fn pow2k(&self, k: u32) -> FieldElement4x64 {
         debug_assert!(k > 0);
         let mut output = *self;
-        for _ in 0..k {
-            output = output.square();
+        unsafe {
+            // One 512-bit scratch buffer, reused across all iterations.
+            let mut wide = MaybeUninit::<[u64; 8]>::uninit();
+            let wide = wide.as_mut_ptr() as *mut u64;
+            let dst = output.0.as_mut_ptr();
+            for _ in 0..k {
+                intrinsics::mul256(wide, dst, dst);
+                reduce_wide(dst, wide);
+            }
         }
         output
     }
 
     /// Returns the square of this field element.
+    #[inline(always)]
     pub fn square(&self) -> FieldElement4x64 {
-        FieldElement4x64(reduce_wide(&intrinsics::mul256(&self.0, &self.0)))
+        let mut output = MaybeUninit::<FieldElement4x64>::uninit();
+        unsafe {
+            let mut wide = MaybeUninit::<[u64; 8]>::uninit();
+            let wide = wide.as_mut_ptr() as *mut u64;
+            intrinsics::mul256(wide, self.0.as_ptr(), self.0.as_ptr());
+            reduce_wide(output.as_mut_ptr() as *mut u64, wide);
+            output.assume_init()
+        }
     }
 
     /// Returns 2 times the square of this field element.
+    #[inline(always)]
     pub fn square2(&self) -> FieldElement4x64 {
-        let square = self.square();
-        &square + &square
+        let mut output = MaybeUninit::<FieldElement4x64>::uninit();
+        unsafe {
+            let mut wide = MaybeUninit::<[u64; 8]>::uninit();
+            let wide = wide.as_mut_ptr() as *mut u64;
+            let mut square = MaybeUninit::<[u64; 4]>::uninit();
+            let square = square.as_mut_ptr() as *mut u64;
+            intrinsics::mul256(wide, self.0.as_ptr(), self.0.as_ptr());
+            reduce_wide(square, wide);
+            // Double: dst may alias both sources; only the final fold
+            // writes `output`.
+            add_fold(output.as_mut_ptr() as *mut u64, square, square, square);
+            output.assume_init()
+        }
     }
 }
 
@@ -536,13 +706,40 @@ impl FieldElement4x64 {
 mod intrinsics_test {
     use super::*;
 
+    // Safe value-style helpers over the pointer-style intrinsics.
+    fn mul256(a: &[u64; 4], b: &[u64; 4]) -> [u64; 8] {
+        let mut dst = [0u64; 8];
+        unsafe { intrinsics::mul256(dst.as_mut_ptr(), a.as_ptr(), b.as_ptr()) };
+        dst
+    }
+    fn redc256(src: &[u64; 8], k: u64) -> [u64; 4] {
+        let mut dst = [0u64; 4];
+        unsafe { intrinsics::redc256(dst.as_mut_ptr(), src.as_ptr(), k) };
+        dst
+    }
+    fn add256(a: &[u64; 4], b: &[u64; 4]) -> ([u64; 4], u64) {
+        let mut dst = [0u64; 4];
+        let carry = unsafe { intrinsics::add256(dst.as_mut_ptr(), a.as_ptr(), b.as_ptr()) };
+        (dst, carry)
+    }
+    fn sub256(a: &[u64; 4], b: &[u64; 4]) -> ([u64; 4], u64) {
+        let mut dst = [0u64; 4];
+        let borrow = unsafe { intrinsics::sub256(dst.as_mut_ptr(), a.as_ptr(), b.as_ptr()) };
+        (dst, borrow)
+    }
+    fn mul256_by_u64(a: &[u64; 4], m: u64) -> ([u64; 4], u64) {
+        let mut dst = [0u64; 4];
+        let hi = unsafe { intrinsics::mul256_by_u64(dst.as_mut_ptr(), a.as_ptr(), m) };
+        (dst, hi)
+    }
+
     /// Check the raw intrinsics against the test vectors from
     /// `polkavm-common/src/operation.rs`.
     #[test]
     fn intrinsics_reference_vectors() {
         // mul256: (2^256 - 1)² = 2^512 - 2^257 + 1
         let max = [u64::MAX; 4];
-        let product = intrinsics::mul256(&max, &max);
+        let product = mul256(&max, &max);
         assert_eq!(
             product,
             [1, 0, 0, 0, u64::MAX - 1, u64::MAX, u64::MAX, u64::MAX]
@@ -550,25 +747,51 @@ mod intrinsics_test {
 
         // add256 carry-out, sub256 borrow-out
         let one = [1, 0, 0, 0];
-        assert_eq!(intrinsics::add256(&max, &one), ([0, 0, 0, 0], 1));
-        assert_eq!(intrinsics::sub256(&[0, 0, 0, 0], &one), (max, 1));
+        assert_eq!(add256(&max, &one), ([0, 0, 0, 0], 1));
+        assert_eq!(sub256(&[0, 0, 0, 0], &one), (max, 1));
 
         // mul256_by_u64: (2^256 - 1)(2^64 - 1) = 2^320 - 2^256 - 2^64 + 1
-        let (lo, hi) = intrinsics::mul256_by_u64(&max, u64::MAX);
+        let (lo, hi) = mul256_by_u64(&max, u64::MAX);
         assert_eq!(lo, [1, u64::MAX, u64::MAX, u64::MAX]);
         assert_eq!(hi, u64::MAX - 1);
 
         // redc256: k = 0 degenerates to src mod 2^256
         let src = [1, 2, 3, 4, 5, 6, 7, 8];
-        assert_eq!(intrinsics::redc256(&src, 0), [1, 2, 3, 4]);
+        assert_eq!(redc256(&src, 0), [1, 2, 3, 4]);
 
         // redc256 with k = 38: src = 2^256 → 38 (mod 2^256 - 38)
         let two_pow_256 = [0, 0, 0, 0, 1, 0, 0, 0];
-        assert_eq!(intrinsics::redc256(&two_pow_256, 38), [38, 0, 0, 0]);
+        assert_eq!(redc256(&two_pow_256, 38), [38, 0, 0, 0]);
 
         // redc256 never returns >= 2^256 even for all-ones input, largest k.
         let all_ones = [u64::MAX; 8];
-        let _ = intrinsics::redc256(&all_ones, u64::MAX);
+        let _ = redc256(&all_ones, u64::MAX);
+    }
+
+    /// The instructions are read-all-then-write: the destination may alias
+    /// the sources. Verify the fallbacks implement that.
+    #[test]
+    fn intrinsics_aliasing() {
+        // x += x, with dst aliasing both sources.
+        let mut x = [1u64, 2, 3, 4];
+        let carry = unsafe { intrinsics::add256(x.as_mut_ptr(), x.as_ptr(), x.as_ptr()) };
+        assert_eq!((x, carry), ([2, 4, 6, 8], 0));
+
+        // x -= x
+        let mut x = [5u64, 6, 7, 8];
+        let borrow = unsafe { intrinsics::sub256(x.as_mut_ptr(), x.as_ptr(), x.as_ptr()) };
+        assert_eq!((x, borrow), ([0, 0, 0, 0], 0));
+
+        // In-place scaling by a u64.
+        let mut x = [u64::MAX, 0, 0, 0];
+        let hi = unsafe { intrinsics::mul256_by_u64(x.as_mut_ptr(), x.as_ptr(), 38) };
+        assert_eq!((x, hi), (([0xffff_ffff_ffff_ffda, 37, 0, 0]), 0));
+
+        // Squaring with both sources aliased (dst is a separate buffer).
+        let x = [3u64, 0, 0, 0];
+        let mut wide = [0u64; 8];
+        unsafe { intrinsics::mul256(wide.as_mut_ptr(), x.as_ptr(), x.as_ptr()) };
+        assert_eq!(wide, [9, 0, 0, 0, 0, 0, 0, 0]);
     }
 }
 
@@ -692,12 +915,34 @@ mod test {
             assert_same(&a.square(), &a51.square(), "square");
             assert_same(&a.square2(), &a51.square2(), "square2");
             assert_same(&(&a + &b), &(&a51 + &b51), "add");
+            assert_same(&(&a + &a), &(&a51 + &a51), "add self");
             assert_same(&(&a - &b), &(&a51 - &b51), "sub");
             assert_same(&(&b - &a), &(&b51 - &a51), "sub (reversed)");
+            assert_same(&(&a - &a), &(&a51 - &a51), "sub self");
             assert_same(&(-&a), &(-&a51), "negate");
             for k in 1..=8 {
                 assert_same(&a.pow2k(k), &a51.pow2k(k), "pow2k");
             }
+
+            // In-place (Assign) variants.
+            let mut x = a;
+            x += &b;
+            let mut x51 = a51;
+            x51 += &b51;
+            assert_same(&x, &x51, "add_assign");
+            let mut x = a;
+            x -= &b;
+            let mut x51 = a51;
+            x51 -= &b51;
+            assert_same(&x, &x51, "sub_assign");
+            let mut x = a;
+            x *= &b;
+            let mut x51 = a51;
+            x51 *= &b51;
+            assert_same(&x, &x51, "mul_assign");
+            let mut x = a;
+            x.negate();
+            assert_same(&x, &(-&a51), "negate in place");
         }
     }
 
