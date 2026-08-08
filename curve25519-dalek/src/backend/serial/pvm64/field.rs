@@ -383,6 +383,42 @@ fn fold_operand(excess: u64) -> *const u64 {
     unsafe { (FOLD.as_ptr() as *const u64).add((excess as usize) << 2) }
 }
 
+/// `out = a + b (mod 2^256 - 38)`: a full field addition. With the
+/// `redc256` instruction available, the exact 257-bit sum — the `add256`
+/// low limbs plus the carry-out placed in the fifth limb of a 512-bit
+/// scratch buffer — is folded with a single `redc256`:
+/// `a + b = lo + c·2^256` with `c ∈ {0, 1}`, and `redc256` returns a value
+/// `≡ lo + 38·c (mod 2^256 - 38 = 2p)` below `2^256`, which is exactly the
+/// backend's representation invariant. This replaces the two carry-fold
+/// `add256`s (and their carry-dependent fold-table lookups) of the
+/// non-`redc256` variant below with one wide instruction.
+///
+/// `out` is written exactly once, by the `redc256`, so LLVM can merge the
+/// output slot with the caller's destination variable; `out` may alias
+/// `a`/`b`. The `scratch` parameter is unused (kept for signature parity
+/// with the non-`redc256` variant).
+///
+/// # Safety
+///
+/// `out` must be a valid pointer to 4 u64 limbs, `a` and `b` valid for
+/// reading 4 u64 limbs. Any aliasing is allowed.
+#[cfg(pvm_redc)]
+#[inline(always)]
+unsafe fn add_fold(out: *mut u64, a: *const u64, b: *const u64, _scratch: *mut u64) {
+    let mut wide = MaybeUninit::<[u64; 8]>::uninit();
+    let s = wide.as_mut_ptr() as *mut u64;
+    // Limbs 5..8 of the 512-bit scratch must be zero. The zero stores do
+    // not depend on the add256, so they sit before it, leaving only the
+    // carry store between the two wide instructions (the recompiler may
+    // fuse adjacent-ish add256/redc256 pairs).
+    *s.add(5) = 0;
+    *s.add(6) = 0;
+    *s.add(7) = 0;
+    let carry = intrinsics::add256(s, a, b);
+    *s.add(4) = carry;
+    intrinsics::redc256(out, s, 38);
+}
+
 /// `out = a + b (mod 2^256 - 38)`: a full field addition, folding the carry
 /// via \\(2\^{256} \equiv 38 \pmod p\\). The first fold can itself carry
 /// (when the limbs are close to \\(2\^{256}\\)), but after such a carry the
@@ -398,6 +434,7 @@ fn fold_operand(excess: u64) -> *const u64 {
 ///
 /// `out` and `scratch` must be valid pointers to 4 u64 limbs, `a` and `b`
 /// valid for reading 4 u64 limbs. Any aliasing is allowed.
+#[cfg(not(pvm_redc))]
 #[inline(always)]
 unsafe fn add_fold(out: *mut u64, a: *const u64, b: *const u64, scratch: *mut u64) {
     let carry = intrinsics::add256(scratch, a, b);
@@ -1065,6 +1102,13 @@ mod test {
         let sum = &max_minus_1 + &max;
         let expected = (37u64 - 1) + 37; // both canonical values, mod p
         assert_eq!(sum.as_bytes()[0], expected as u8);
+        assert_eq!(sum.as_bytes()[1..], [0u8; 31][..]);
+
+        // (2^256 - 1) + (2^256 - 1) = 2^257 - 2: carry-out with the low sum
+        // itself above 2^256 - 38 (in the redc-based addition this makes the
+        // internal t_lo + 38·c fold overflow into the h limb).
+        let sum = &max + &max;
+        assert_eq!(sum.as_bytes()[0], 2 * 37);
         assert_eq!(sum.as_bytes()[1..], [0u8; 31][..]);
 
         // Multiplication with maximal non-canonical inputs.
