@@ -134,6 +134,37 @@ mod intrinsics {
             );
             hi
         }
+
+        /// Fused multiply-reduce: `scratch = lhs * rhs` (the full 512-bit
+        /// product) immediately followed by `dst = fold(scratch mod
+        /// (2^256 - k))`.
+        ///
+        /// Semantically identical to `mul256` + `redc256` on the same
+        /// buffers, but emitted as a single `asm!` block so the two
+        /// instructions are guaranteed adjacent in the instruction stream
+        /// (nothing — address materialization in particular — can be
+        /// scheduled between them), which lets the PVM recompiler fuse the
+        /// pair. The scratch buffer stays architectural: it is still
+        /// written.
+        #[inline(always)]
+        pub unsafe fn mul256_redc256(
+            dst: *mut [u64; 4],
+            scratch: *mut [u64; 8],
+            lhs: *const [u64; 4],
+            rhs: *const [u64; 4],
+            k: u64,
+        ) {
+            asm!(
+                ".insn r 0xb, 4, 0, {s}, {a}, {b}",
+                ".insn r 0xb, 4, 1, {d}, {s}, {k}",
+                s = in(reg) scratch,
+                d = in(reg) dst,
+                a = in(reg) lhs,
+                b = in(reg) rhs,
+                k = in(reg) k,
+                options(nostack),
+            );
+        }
     }
 
     // Pure-Rust fallbacks. The `wide_*` reference functions are copied
@@ -276,6 +307,25 @@ mod intrinsics {
             ptr::write(dst as *mut [u64; 4], result);
             hi
         }
+
+        /// Fused multiply-reduce: `scratch = lhs * rhs` (the full 512-bit
+        /// product) immediately followed by `dst = fold(scratch mod
+        /// (2^256 - k))`. Semantically identical to `mul256` + `redc256` on
+        /// the same buffers.
+        #[inline(always)]
+        pub unsafe fn mul256_redc256(
+            dst: *mut [u64; 4],
+            scratch: *mut [u64; 8],
+            lhs: *const [u64; 4],
+            rhs: *const [u64; 4],
+            k: u64,
+        ) {
+            let lhs = ptr::read(lhs);
+            let rhs = ptr::read(rhs);
+            let product = wide_mul256(&lhs, &rhs);
+            ptr::write(scratch, product);
+            ptr::write(dst, wide_redc256(&product, k));
+        }
     }
 
     pub(super) use imp::*;
@@ -375,32 +425,41 @@ unsafe fn sub_fold(out: *mut u64, a: *const u64, b: *const u64, scratch: *mut u6
     debug_assert_eq!(borrow, 0);
 }
 
-/// Reduce the 512-bit product at `wide` to a 256-bit residue modulo
-/// \\(2\^{256} - 38 = 2p\\), written to `dst`.
+/// `dst = (lhs * rhs) mod (2^256 - 38)`: a full field multiplication, using
+/// `wide` as the 512-bit product scratch. With the `redc256` instruction,
+/// this is the fused `mul256_redc256` intrinsic, guaranteeing the two
+/// instructions are adjacent so the recompiler can fuse them.
 ///
 /// # Safety
 ///
-/// `dst` must be valid for 4 u64 limbs and `wide` for 8; they must not
-/// overlap (`wide` is always a private stack scratch buffer here).
+/// `dst` must be valid for 4 u64 limbs and `wide` for 8; `wide` must not
+/// overlap the other operands (it is always a private stack scratch buffer
+/// here). `dst` may alias `lhs`/`rhs`.
 #[cfg(pvm_redc)]
 #[inline(always)]
-unsafe fn reduce_wide(dst: *mut u64, wide: *mut u64) {
-    intrinsics::redc256(dst, wide, 38);
+unsafe fn mul_reduce(dst: *mut u64, wide: *mut u64, lhs: *const u64, rhs: *const u64) {
+    intrinsics::mul256_redc256(
+        dst as *mut [u64; 4],
+        wide as *mut [u64; 8],
+        lhs as *const [u64; 4],
+        rhs as *const [u64; 4],
+        38,
+    );
 }
 
-/// Reduce the 512-bit product at `wide` to a 256-bit residue modulo
-/// \\(2\^{256} - 38 = 2p\\), written to `dst`, without the `redc256`
+/// `dst = (lhs * rhs) mod (2^256 - 38)`: a full field multiplication, using
+/// `wide` as the 512-bit product scratch, without the `redc256`
 /// instruction. Clobbers `wide`. As in [`add_fold`], the intermediate sums
 /// accumulate in the scratch buffer and only the final fold writes `dst`,
 /// exactly once.
 ///
 /// # Safety
 ///
-/// `dst` must be valid for 4 u64 limbs and `wide` for 8; they must not
-/// overlap (`wide` is always a private stack scratch buffer here).
+/// As for the `pvm_redc` variant above.
 #[cfg(not(pvm_redc))]
 #[inline(always)]
-unsafe fn reduce_wide(dst: *mut u64, wide: *mut u64) {
+unsafe fn mul_reduce(dst: *mut u64, wide: *mut u64, lhs: *const u64, rhs: *const u64) {
+    intrinsics::mul256(wide, lhs, rhs);
     let lo = wide;
     let hi = wide.add(4);
     // lo + 2^256·hi ≡ lo + 38·hi (mod 2^256 - 38); compute 38·hi in place
@@ -488,8 +547,7 @@ impl<'b> MulAssign<&'b FieldElement4x64> for FieldElement4x64 {
         unsafe {
             let mut wide = MaybeUninit::<[u64; 8]>::uninit();
             let wide = wide.as_mut_ptr() as *mut u64;
-            intrinsics::mul256(wide, self.0.as_ptr(), rhs.0.as_ptr());
-            reduce_wide(self.0.as_mut_ptr(), wide);
+            mul_reduce(self.0.as_mut_ptr(), wide, self.0.as_ptr(), rhs.0.as_ptr());
         }
     }
 }
@@ -502,8 +560,12 @@ impl<'a, 'b> Mul<&'b FieldElement4x64> for &'a FieldElement4x64 {
         unsafe {
             let mut wide = MaybeUninit::<[u64; 8]>::uninit();
             let wide = wide.as_mut_ptr() as *mut u64;
-            intrinsics::mul256(wide, self.0.as_ptr(), rhs.0.as_ptr());
-            reduce_wide(output.as_mut_ptr() as *mut u64, wide);
+            mul_reduce(
+                output.as_mut_ptr() as *mut u64,
+                wide,
+                self.0.as_ptr(),
+                rhs.0.as_ptr(),
+            );
             output.assume_init()
         }
     }
@@ -663,8 +725,7 @@ impl FieldElement4x64 {
             let wide = wide.as_mut_ptr() as *mut u64;
             let dst = output.0.as_mut_ptr();
             for _ in 0..k {
-                intrinsics::mul256(wide, dst, dst);
-                reduce_wide(dst, wide);
+                mul_reduce(dst, wide, dst, dst);
             }
         }
         output
@@ -677,8 +738,12 @@ impl FieldElement4x64 {
         unsafe {
             let mut wide = MaybeUninit::<[u64; 8]>::uninit();
             let wide = wide.as_mut_ptr() as *mut u64;
-            intrinsics::mul256(wide, self.0.as_ptr(), self.0.as_ptr());
-            reduce_wide(output.as_mut_ptr() as *mut u64, wide);
+            mul_reduce(
+                output.as_mut_ptr() as *mut u64,
+                wide,
+                self.0.as_ptr(),
+                self.0.as_ptr(),
+            );
             output.assume_init()
         }
     }
@@ -692,8 +757,7 @@ impl FieldElement4x64 {
             let wide = wide.as_mut_ptr() as *mut u64;
             let mut square = MaybeUninit::<[u64; 4]>::uninit();
             let square = square.as_mut_ptr() as *mut u64;
-            intrinsics::mul256(wide, self.0.as_ptr(), self.0.as_ptr());
-            reduce_wide(square, wide);
+            mul_reduce(square, wide, self.0.as_ptr(), self.0.as_ptr());
             // Double: dst may alias both sources; only the final fold
             // writes `output`.
             add_fold(output.as_mut_ptr() as *mut u64, square, square, square);
@@ -766,6 +830,38 @@ mod intrinsics_test {
         // redc256 never returns >= 2^256 even for all-ones input, largest k.
         let all_ones = [u64::MAX; 8];
         let _ = redc256(&all_ones, u64::MAX);
+    }
+
+    /// The fused `mul256_redc256` must be exactly `mul256` followed by
+    /// `redc256` on the same buffers, including the (architectural) scratch
+    /// buffer contents.
+    #[test]
+    fn fused_mul256_redc256_matches_pair() {
+        let cases: [([u64; 4], [u64; 4], u64); 4] = [
+            ([u64::MAX; 4], [u64::MAX; 4], 38),
+            ([1, 2, 3, 4], [5, 6, 7, 8], 38),
+            ([u64::MAX; 4], [u64::MAX; 4], u64::MAX),
+            ([0xdead_beef, 0, 1, u64::MAX], [42, u64::MAX, 0, 7], 0),
+        ];
+        for (a, b, k) in cases {
+            let product = mul256(&a, &b);
+            let expected = redc256(&product, k);
+
+            let mut scratch = [0u64; 8];
+            let mut dst = [0u64; 4];
+            unsafe {
+                intrinsics::mul256_redc256(&mut dst, &mut scratch, &a, &b, k);
+            }
+            assert_eq!(scratch, product, "fused scratch mismatch");
+            assert_eq!(dst, expected, "fused dst mismatch");
+
+            // dst may alias an input (as in in-place squaring).
+            let mut x = a;
+            unsafe {
+                intrinsics::mul256_redc256(&mut x, &mut scratch, &x, &b, k);
+            }
+            assert_eq!(x, expected, "fused dst-aliases-lhs mismatch");
+        }
     }
 
     /// The instructions are read-all-then-write: the destination may alias
