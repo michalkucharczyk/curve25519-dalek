@@ -63,14 +63,39 @@ mod intrinsics {
     mod imp {
         use core::arch::asm;
 
+        // # The destroyed-register contract
+        //
+        // Every wide-arithmetic instruction *destroys* a fixed register set
+        // plus its operand registers — they read as zero afterwards, and the
+        // carry-out (where present) is written after the zeroing (see
+        // `wide_arith_destroyed` in polkavm-common). That is what lets the
+        // PVM recompiler use their host homes as save-free scratch for the
+        // multi-register kernels these instructions expand into.
+        //
+        // The multiply family (`mul256`, `redc256`, `mul256_by_u64`, and the
+        // fused pair) destroys {t0, t1, t2, a0..a5}; `add256`/`sub256`
+        // destroy the smaller {t0, t1, t2, a0..a3}. The operands are pinned
+        // to fixed registers inside the destroyed set and the rest is
+        // declared as clobbers, which hands the job of keeping live values
+        // out of harm's way to LLVM — the one party that actually knows what
+        // is live. `ra`, `sp`, `s0` and `s1` are never destroyed and stay
+        // available across every intrinsic (`add256`/`sub256` additionally
+        // spare `a4`/`a5`).
+
         /// Full 512-bit product: `dst[0..8] = lhs[0..4] * rhs[0..4]`.
         #[inline(always)]
         pub unsafe fn mul256(dst: *mut u64, lhs: *const u64, rhs: *const u64) {
             asm!(
-                ".insn r 0xb, 4, 0, {d}, {a}, {b}",
-                d = in(reg) dst,
-                a = in(reg) lhs,
-                b = in(reg) rhs,
+                ".insn r 0xb, 4, 0, a0, a1, a2",
+                inout("a0") dst => _,
+                inout("a1") lhs => _,
+                inout("a2") rhs => _,
+                lateout("a3") _,
+                lateout("a4") _,
+                lateout("a5") _,
+                lateout("t0") _,
+                lateout("t1") _,
+                lateout("t2") _,
                 options(nostack),
             );
         }
@@ -81,10 +106,16 @@ mod intrinsics {
         #[inline(always)]
         pub unsafe fn redc256(dst: *mut u64, src: *const u64, k: u64) {
             asm!(
-                ".insn r 0xb, 4, 1, {d}, {s}, {k}",
-                d = in(reg) dst,
-                s = in(reg) src,
-                k = in(reg) k,
+                ".insn r 0xb, 4, 1, a0, a1, a2",
+                inout("a0") dst => _,
+                inout("a1") src => _,
+                inout("a2") k => _,
+                lateout("a3") _,
+                lateout("a4") _,
+                lateout("a5") _,
+                lateout("t0") _,
+                lateout("t1") _,
+                lateout("t2") _,
                 options(nostack),
             );
         }
@@ -94,11 +125,14 @@ mod intrinsics {
         pub unsafe fn add256(dst: *mut u64, lhs: *const u64, rhs: *const u64) -> u64 {
             let carry: u64;
             asm!(
-                ".insn r4 0xb, 5, 0, {c}, {a}, {b}, {d}",
-                c = out(reg) carry,
-                a = in(reg) lhs,
-                b = in(reg) rhs,
-                d = in(reg) dst,
+                ".insn r4 0xb, 5, 0, a0, a1, a2, a3",
+                out("a0") carry,
+                inout("a1") lhs => _,
+                inout("a2") rhs => _,
+                inout("a3") dst => _,
+                lateout("t0") _,
+                lateout("t1") _,
+                lateout("t2") _,
                 options(nostack),
             );
             carry
@@ -109,11 +143,14 @@ mod intrinsics {
         pub unsafe fn sub256(dst: *mut u64, lhs: *const u64, rhs: *const u64) -> u64 {
             let borrow: u64;
             asm!(
-                ".insn r4 0xb, 5, 1, {c}, {a}, {b}, {d}",
-                c = out(reg) borrow,
-                a = in(reg) lhs,
-                b = in(reg) rhs,
-                d = in(reg) dst,
+                ".insn r4 0xb, 5, 1, a0, a1, a2, a3",
+                out("a0") borrow,
+                inout("a1") lhs => _,
+                inout("a2") rhs => _,
+                inout("a3") dst => _,
+                lateout("t0") _,
+                lateout("t1") _,
+                lateout("t2") _,
                 options(nostack),
             );
             borrow
@@ -125,11 +162,16 @@ mod intrinsics {
         pub unsafe fn mul256_by_u64(dst: *mut u64, lhs: *const u64, rhs: u64) -> u64 {
             let hi: u64;
             asm!(
-                ".insn r4 0xb, 5, 2, {hi}, {a}, {m}, {d}",
-                hi = out(reg) hi,
-                a = in(reg) lhs,
-                m = in(reg) rhs,
-                d = in(reg) dst,
+                ".insn r4 0xb, 5, 2, a0, a1, a2, a3",
+                out("a0") hi,
+                inout("a1") lhs => _,
+                inout("a2") rhs => _,
+                inout("a3") dst => _,
+                lateout("a4") _,
+                lateout("a5") _,
+                lateout("t0") _,
+                lateout("t1") _,
+                lateout("t2") _,
                 options(nostack),
             );
             hi
@@ -139,13 +181,13 @@ mod intrinsics {
         /// product) immediately followed by `dst = fold(scratch mod
         /// (2^256 - k))`.
         ///
-        /// Semantically identical to `mul256` + `redc256` on the same
-        /// buffers, but emitted as a single `asm!` block so the two
-        /// instructions are guaranteed adjacent in the instruction stream
-        /// (nothing — address materialization in particular — can be
-        /// scheduled between them), which lets the PVM recompiler fuse the
-        /// pair. The scratch buffer stays architectural: it is still
-        /// written.
+        /// Emitted as the canonical adjacent pair (with `k` pinned to `a4`)
+        /// that the polkavm linker collapses into the single fused
+        /// `mul256_redc256` PVM opcode — one instruction, one set of probes,
+        /// and the product folded straight from host registers. The single
+        /// `asm!` block guarantees the two words are adjacent with nothing
+        /// scheduled between them. The scratch buffer stays architectural:
+        /// it is still written.
         #[inline(always)]
         pub unsafe fn mul256_redc256(
             dst: *mut [u64; 4],
@@ -155,13 +197,17 @@ mod intrinsics {
             k: u64,
         ) {
             asm!(
-                ".insn r 0xb, 4, 0, {s}, {a}, {b}",
-                ".insn r 0xb, 4, 1, {d}, {s}, {k}",
-                s = in(reg) scratch,
-                d = in(reg) dst,
-                a = in(reg) lhs,
-                b = in(reg) rhs,
-                k = in(reg) k,
+                ".insn r 0xb, 4, 0, a1, a2, a3",
+                ".insn r 0xb, 4, 1, a0, a1, a4",
+                inout("a0") dst => _,
+                inout("a1") scratch => _,
+                inout("a2") lhs => _,
+                inout("a3") rhs => _,
+                inout("a4") k => _,
+                lateout("a5") _,
+                lateout("t0") _,
+                lateout("t1") _,
+                lateout("t2") _,
                 options(nostack),
             );
         }
