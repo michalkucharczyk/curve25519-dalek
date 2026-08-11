@@ -156,6 +156,49 @@ mod intrinsics {
             borrow
         }
 
+        /// `dst[0..4] = (lhs + rhs) folded modulo (2^256 - k)`: one instruction
+        /// for what used to be an `add256`, a store of its carry-out into the
+        /// fifth limb of a 512-bit buffer, and a `redc256` over that buffer.
+        /// The result is identical to that sequence, bit for bit.
+        ///
+        /// There is no carry-out — the fold consumes it — and no scratch
+        /// buffer. `k` is an explicit operand (unlike the fused
+        /// multiply-reduce, whose four instruction slots were already full of
+        /// pointers, so its `k` has to live in `a4`).
+        #[inline(always)]
+        pub unsafe fn add256_redc256(dst: *mut u64, lhs: *const u64, rhs: *const u64, k: u64) {
+            asm!(
+                ".insn r4 0xb, 6, 0, a0, a1, a2, a3",
+                inout("a0") k => _,
+                inout("a1") lhs => _,
+                inout("a2") rhs => _,
+                inout("a3") dst => _,
+                lateout("t0") _,
+                lateout("t1") _,
+                lateout("t2") _,
+                options(nostack),
+            );
+        }
+
+        /// `dst[0..4] = (lhs - rhs) folded modulo (2^256 - k)`: one instruction
+        /// for what used to be a chain of three `sub256`s (the subtraction plus
+        /// two borrow folds). As for [`add256_redc256`], no borrow-out and no
+        /// scratch buffer.
+        #[inline(always)]
+        pub unsafe fn sub256_redc256(dst: *mut u64, lhs: *const u64, rhs: *const u64, k: u64) {
+            asm!(
+                ".insn r4 0xb, 6, 1, a0, a1, a2, a3",
+                inout("a0") k => _,
+                inout("a1") lhs => _,
+                inout("a2") rhs => _,
+                inout("a3") dst => _,
+                lateout("t0") _,
+                lateout("t1") _,
+                lateout("t2") _,
+                options(nostack),
+            );
+        }
+
         /// `dst[0..4] = low256(lhs * rhs)`; returns bits 256..319 of the full
         /// product.
         #[inline(always)]
@@ -354,6 +397,41 @@ mod intrinsics {
             hi
         }
 
+        /// Sync with `wide_add256_redc256` in
+        /// `polkavm-common/src/operation.rs`.
+        #[inline]
+        fn wide_add256_redc256(lhs: &[u64; 4], rhs: &[u64; 4], k: u64) -> [u64; 4] {
+            let (sum, carry) = wide_add256(lhs, rhs);
+            wide_redc256(&[sum[0], sum[1], sum[2], sum[3], carry, 0, 0, 0], k)
+        }
+
+        /// Sync with `wide_sub256_redc256` in
+        /// `polkavm-common/src/operation.rs`.
+        #[inline]
+        fn wide_sub256_redc256(lhs: &[u64; 4], rhs: &[u64; 4], k: u64) -> [u64; 4] {
+            let (r, borrow) = wide_sub256(lhs, rhs);
+            let (r, borrow) = wide_sub256(&r, &[if borrow != 0 { k } else { 0 }, 0, 0, 0]);
+            let (dst, borrow) = wide_sub256(&r, &[if borrow != 0 { k } else { 0 }, 0, 0, 0]);
+            debug_assert_eq!(borrow, 0);
+            dst
+        }
+
+        /// `dst[0..4] = (lhs + rhs) folded modulo (2^256 - k)`.
+        #[inline(always)]
+        pub unsafe fn add256_redc256(dst: *mut u64, lhs: *const u64, rhs: *const u64, k: u64) {
+            let lhs = ptr::read(lhs as *const [u64; 4]);
+            let rhs = ptr::read(rhs as *const [u64; 4]);
+            ptr::write(dst as *mut [u64; 4], wide_add256_redc256(&lhs, &rhs, k));
+        }
+
+        /// `dst[0..4] = (lhs - rhs) folded modulo (2^256 - k)`.
+        #[inline(always)]
+        pub unsafe fn sub256_redc256(dst: *mut u64, lhs: *const u64, rhs: *const u64, k: u64) {
+            let lhs = ptr::read(lhs as *const [u64; 4]);
+            let rhs = ptr::read(rhs as *const [u64; 4]);
+            ptr::write(dst as *mut [u64; 4], wide_sub256_redc256(&lhs, &rhs, k));
+        }
+
         /// Fused multiply-reduce: `scratch = lhs * rhs` (the full 512-bit
         /// product) immediately followed by `dst = fold(scratch mod
         /// (2^256 - k))`. Semantically identical to `mul256` + `redc256` on
@@ -439,10 +517,10 @@ fn fold_operand(excess: u64) -> *const u64 {
 /// `add256`s (and their carry-dependent fold-table lookups) of the
 /// non-`redc256` variant below with one wide instruction.
 ///
-/// `out` is written exactly once, by the `redc256`, so LLVM can merge the
-/// output slot with the caller's destination variable; `out` may alias
-/// `a`/`b`. The `scratch` parameter is unused (kept for signature parity
-/// with the non-`redc256` variant).
+/// `out` is written exactly once, so LLVM can merge the output slot with the
+/// caller's destination variable; `out` may alias `a`/`b`. The `scratch`
+/// parameter is unused (kept for signature parity with the non-`redc256`
+/// variant).
 ///
 /// # Safety
 ///
@@ -451,18 +529,7 @@ fn fold_operand(excess: u64) -> *const u64 {
 #[cfg(pvm_redc)]
 #[inline(always)]
 unsafe fn add_fold(out: *mut u64, a: *const u64, b: *const u64, _scratch: *mut u64) {
-    let mut wide = MaybeUninit::<[u64; 8]>::uninit();
-    let s = wide.as_mut_ptr() as *mut u64;
-    // Limbs 5..8 of the 512-bit scratch must be zero. The zero stores do
-    // not depend on the add256, so they sit before it, leaving only the
-    // carry store between the two wide instructions (the recompiler may
-    // fuse adjacent-ish add256/redc256 pairs).
-    *s.add(5) = 0;
-    *s.add(6) = 0;
-    *s.add(7) = 0;
-    let carry = intrinsics::add256(s, a, b);
-    *s.add(4) = carry;
-    intrinsics::redc256(out, s, 38);
+    intrinsics::add256_redc256(out, a, b, 38);
 }
 
 /// `out = a + b (mod 2^256 - 38)`: a full field addition, folding the carry
@@ -879,6 +946,16 @@ mod intrinsics_test {
         let hi = unsafe { intrinsics::mul256_by_u64(dst.as_mut_ptr(), a.as_ptr(), m) };
         (dst, hi)
     }
+    fn add256_redc256(a: &[u64; 4], b: &[u64; 4], k: u64) -> [u64; 4] {
+        let mut dst = [0u64; 4];
+        unsafe { intrinsics::add256_redc256(dst.as_mut_ptr(), a.as_ptr(), b.as_ptr(), k) };
+        dst
+    }
+    fn sub256_redc256(a: &[u64; 4], b: &[u64; 4], k: u64) -> [u64; 4] {
+        let mut dst = [0u64; 4];
+        unsafe { intrinsics::sub256_redc256(dst.as_mut_ptr(), a.as_ptr(), b.as_ptr(), k) };
+        dst
+    }
 
     /// Check the raw intrinsics against the test vectors from
     /// `polkavm-common/src/operation.rs`.
@@ -945,6 +1022,50 @@ mod intrinsics_test {
             }
             assert_eq!(x, expected, "fused dst-aliases-lhs mismatch");
         }
+    }
+
+    /// The fused folds must be exactly the multi-instruction sequences they
+    /// replace: `add256` + carry-into-limb-4 + `redc256` for the addition, and
+    /// a chain of three `sub256`s (op plus two borrow folds) for the
+    /// subtraction.
+    #[test]
+    fn fused_folds_match_sequences() {
+        let operands: [[u64; 4]; 6] = [
+            [u64::MAX; 4],
+            [0, 0, 0, 0],
+            [1, 0, 0, 0],
+            // 2^256 - 5: the difference from zero is small enough to need the
+            // second borrow fold.
+            [u64::MAX - 4, u64::MAX, u64::MAX, u64::MAX],
+            [0xdead_beef_1234_5678, 0x9e37_79b9_7f4a_7c15, 0, u64::MAX],
+            [0x243f_6a88_85a3_08d3, u64::MAX, 0, 0x082e_fa98_ec4e_6c89],
+        ];
+
+        for k in [0, 38, (1u64 << 32) + 977, u64::MAX] {
+            for a in operands {
+                for b in operands {
+                    let (sum, carry) = add256(&a, &b);
+                    let expected = redc256(&[sum[0], sum[1], sum[2], sum[3], carry, 0, 0, 0], k);
+                    assert_eq!(add256_redc256(&a, &b, k), expected, "add k = {k:#x}");
+
+                    let (r, borrow) = sub256(&a, &b);
+                    let (r, borrow) = sub256(&r, &[if borrow != 0 { k } else { 0 }, 0, 0, 0]);
+                    let (expected, borrow) = sub256(&r, &[if borrow != 0 { k } else { 0 }, 0, 0, 0]);
+                    assert_eq!(borrow, 0, "the third borrow fold must never borrow");
+                    assert_eq!(sub256_redc256(&a, &b, k), expected, "sub k = {k:#x}");
+                }
+            }
+        }
+
+        // The destination may alias both sources.
+        let k = 38;
+        let mut x = [u64::MAX; 4];
+        unsafe { intrinsics::add256_redc256(x.as_mut_ptr(), x.as_ptr(), x.as_ptr(), k) };
+        assert_eq!(x, [74, 0, 0, 0], "2·(2^256 - 1) ≡ 2·38 - 2 (mod 2^256 - 38)");
+
+        let mut x = [1u64, 2, 3, 4];
+        unsafe { intrinsics::sub256_redc256(x.as_mut_ptr(), x.as_ptr(), x.as_ptr(), k) };
+        assert_eq!(x, [0, 0, 0, 0]);
     }
 
     /// The instructions are read-all-then-write: the destination may alias
