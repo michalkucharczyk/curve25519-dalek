@@ -489,6 +489,10 @@ const P: [u64; 4] = [
 /// The lookup address depends on the (potentially secret-derived) carry, but
 /// every PVM instruction has uniform cost, so this is not observable under
 /// the PVM execution model this backend targets.
+///
+/// Only the non-`redc256` route needs this: with the fused fold instructions
+/// the carry never becomes a value the guest has to act on.
+#[cfg(not(pvm_redc))]
 static FOLD: [[u64; 4]; 39] = {
     let mut table = [[0u64; 4]; 39];
     let mut i = 0;
@@ -501,6 +505,7 @@ static FOLD: [[u64; 4]; 39] = {
 
 /// Pointer to the fold operand `[38·excess, 0, 0, 0]`. Requires
 /// `excess <= 38`.
+#[cfg(not(pvm_redc))]
 #[inline(always)]
 fn fold_operand(excess: u64) -> *const u64 {
     debug_assert!(excess <= 38);
@@ -558,15 +563,34 @@ unsafe fn add_fold(out: *mut u64, a: *const u64, b: *const u64, scratch: *mut u6
 
 /// `out = a - b (mod 2^256 - 38)`: a full field subtraction, folding the
 /// borrow by subtracting \\(38 \cdot \mathrm{borrow}\\) (since
-/// \\(-2\^{256} \equiv -38 \pmod p\\)). The first fold can itself borrow
-/// (when the difference is tiny), but after such a borrow the value is close
-/// to \\(2\^{256}\\), so the second fold can never borrow.
+/// \\(-2\^{256} \equiv -38 \pmod p\\)). With the fused instruction available
+/// this is one `sub256_redc256`, replacing the three-`sub256` chain of the
+/// variant below — the biggest single instruction-count win in the backend
+/// (`fe_sub` is the most frequent field operation in the ladder).
+///
+/// `out` is written exactly once; `out` may alias `a`/`b`. The `scratch`
+/// parameter is unused (kept for signature parity).
+///
+/// # Safety
+///
+/// As for [`add_fold`].
+#[cfg(pvm_redc)]
+#[inline(always)]
+unsafe fn sub_fold(out: *mut u64, a: *const u64, b: *const u64, _scratch: *mut u64) {
+    intrinsics::sub256_redc256(out, a, b, 38);
+}
+
+/// `out = a - b (mod 2^256 - 38)` without the fused instruction: the
+/// subtraction plus two borrow folds. The first fold can itself borrow (when
+/// the difference is tiny), but after such a borrow the value is close to
+/// \\(2\^{256}\\), so the second fold can never borrow.
 ///
 /// See [`add_fold`] for the role of `scratch` and the write-once `out`.
 ///
 /// # Safety
 ///
 /// As for [`add_fold`].
+#[cfg(not(pvm_redc))]
 #[inline(always)]
 unsafe fn sub_fold(out: *mut u64, a: *const u64, b: *const u64, scratch: *mut u64) {
     let borrow = intrinsics::sub256(scratch, a, b);
@@ -826,8 +850,8 @@ impl FieldElement4x64 {
         // p.
         static NINETEEN_Q: [[u64; 4]; 3] = [[0, 0, 0, 0], [19, 0, 0, 0], [38, 0, 0, 0]];
 
-        // As with `FOLD`, the secret-dependent table index is fine under the
-        // PVM execution model this backend targets.
+        // As with the fold-operand table above, the secret-dependent table
+        // index is fine under the PVM execution model this backend targets.
         fn reduce_once(v: [u64; 4]) -> [u64; 4] {
             let mut r = MaybeUninit::<[u64; 4]>::uninit();
             unsafe {
